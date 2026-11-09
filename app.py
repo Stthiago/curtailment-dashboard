@@ -11,6 +11,8 @@ st.set_page_config(
 
 st.title("Análise de Curtailment")
 st.caption("Plataforma pública de análise de geração renovável")
+st.divider()
+
 
 dados = pd.DataFrame({
     "Mes": ["Jul", "Ago", "Set", "Out"],
