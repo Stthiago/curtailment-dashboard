@@ -1,197 +1,216 @@
-import io
 from pathlib import Path
+import io
+import re
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title='Curtailment Brasil | ONS', page_icon='⚡', layout='wide', initial_sidebar_state='expanded')
+st.set_page_config(page_title='Constrained-off | SIN', page_icon='⚡', layout='wide', initial_sidebar_state='expanded')
 ROOT = Path(__file__).resolve().parent
-LOCAL_DATA_DIR = Path(r'C:\Users\tsc\OneDrive - Elera\Desktop\Projeto LT (Pós)')
-FILES = {'Fotovoltaica': 'RESTRICAO_COFF_FOTOVOLTAICA_2026_11.xlsx', 'Eólica': 'RESTRICAO_COFF_EOLICA_2026_11.xlsx'}
-REASONS = ['ENE', 'CNF', 'REL']
-COLORS = {'ENE':'#f59e0b','CNF':'#8b5cf6','REL':'#06b6d4','Fotovoltaica':'#fbbf24','Eólica':'#38bdf8'}
-NUMERIC = ['val_geracao','val_geracaolimitada','val_disponibilidade','val_geracaoreferencia','val_geracaoreferenciafinal','val_geracaonaorealizadaapurada','num_minutos_rel','num_minutos_cnf','num_minutos_ene','num_minutos_restricao']
-st.markdown('''<style>.block-container{padding-top:1.3rem;max-width:1600px}.stMetric{background:rgba(125,125,125,.07);padding:16px;border-radius:14px;border:1px solid rgba(125,125,125,.16)}h1{letter-spacing:-.04em}div[data-testid="stSidebar"]{border-right:1px solid rgba(125,125,125,.15)}</style>''', unsafe_allow_html=True)
+LOCAL = Path(r'C:\Users\tsc\OneDrive - Elera\Desktop\Projeto LT (Pós)')
+COLORS = {'ENE':'#F59E0B','CNF':'#8B5CF6','REL':'#06B6D4','Fotovoltaica':'#EAB308','Eólica':'#3B82F6'}
+REASONS = ['ENE','CNF','REL']
+NUMS = ['val_geracao','val_geracaolimitada','val_disponibilidade','val_geracaoreferencia','val_geracaoreferenciafinal','val_geracaonaorealizadaapurada','num_minutos_rel','num_minutos_cnf','num_minutos_ene','num_minutos_restricao']
+LABELS = {'nom_usina':'Conjunto','nom_estado':'Estado','nom_subsistema':'Submercado','nom_agenteoperador':'Agente operador','nom_pontoconexao':'Ponto de conexão'}
+st.markdown('''<style>.block-container{max-width:1650px;padding-top:1.2rem;padding-bottom:3rem}h1,h2,h3{letter-spacing:-.035em}div[data-testid="stMetric"]{background:rgba(115,130,160,.08);padding:18px;border-radius:14px;border:1px solid rgba(120,140,170,.18)}div[data-testid="stMetricLabel"]{font-weight:600}div[data-testid="stSidebar"]{border-right:1px solid rgba(140,140,140,.18)}.subtitle{opacity:.72;font-size:14px}.eyebrow{font-size:12px;letter-spacing:.12em;font-weight:750;color:#38BDF8;text-transform:uppercase}.footnote{font-size:12px;opacity:.7}</style>''', unsafe_allow_html=True)
 
-@st.cache_data(show_spinner='Lendo bases ONS...')
-def load_data(file_bytes=None, file_signatures=()):
-    chunks=[]
-    for fonte, filename in FILES.items():
-        if file_bytes and fonte in file_bytes:
-            stream=io.BytesIO(file_bytes[fonte])
-        else:
-            # Primeiro tenta a pasta local do Windows; depois a pasta do app.
-            path = next((candidate for candidate in (LOCAL_DATA_DIR / filename, ROOT / filename) if candidate.is_file()), None)
-            if path is None:
-                continue
-            stream=path
-        d=pd.read_excel(stream, engine='openpyxl')
-        d.columns=d.columns.str.strip().str.lower()
-        d['fonte']=fonte
-        chunks.append(d)
-    if not chunks:
-        return pd.DataFrame()
-    df=pd.concat(chunks, ignore_index=True)
-    df['din_instante']=pd.to_datetime(df['din_instante'], errors='coerce')
-    df=df.dropna(subset=['din_instante'])
-    for col in NUMERIC:
-        if col in df:
-            df[col]=pd.to_numeric(df[col],errors='coerce')
-        else:
-            df[col]=np.nan
-    for col in ['nom_usina','nom_estado','nom_subsistema','cod_razaorestricao','nom_agenteoperador','nom_pontoconexao','id_ons']:
-        if col not in df: df[col]=''
-        df[col]=df[col].fillna('Não informado').astype(str).str.strip()
+def source_type(name):
+    name=name.upper()
+    if 'FOTOVOLTAICA' in name or 'SOLAR' in name: return 'Fotovoltaica'
+    if 'EOLICA' in name or 'EÓLICA' in name: return 'Eólica'
+    return None
+
+def discover_files():
+    # Cloud: arquivos no repositório; local: pasta do Windows como alternativa.
+    found={}
+    for folder in [LOCAL,ROOT,ROOT/'Bases']:
+        if folder.is_dir():
+            for path in sorted(folder.glob('RESTRICAO_COFF_*.xlsx')):
+                if source_type(path.name):
+                    # Arquivos iguais na pasta Bases prevalecem sobre os da raiz.
+                    found[path.name]=path
+    return list(found.values())
+
+@st.cache_data(show_spinner='Preparando séries de geração e restrição...')
+def read_files(paths_and_signatures, uploads=()):
+    frames=[]
+    for path,_,_ in paths_and_signatures:
+        p=Path(path)
+        try:
+            d=pd.read_excel(p,engine='openpyxl')
+            d['arquivo_origem']=p.name
+            d['fonte']=source_type(p.name)
+            frames.append(d)
+        except Exception as exc:
+            st.warning(f'Falha ao ler {p.name}: {exc}')
+    for name,data in uploads:
+        try:
+            d=pd.read_excel(io.BytesIO(data),engine='openpyxl')
+            d['arquivo_origem']=name
+            d['fonte']=source_type(name)
+            frames.append(d)
+        except Exception as exc:
+            st.warning(f'Falha ao ler {name}: {exc}')
+    if not frames: return pd.DataFrame()
+    df=pd.concat(frames,ignore_index=True)
+    df.columns=df.columns.astype(str).str.strip().str.lower()
+    if 'din_instante' not in df: return pd.DataFrame()
+    df['din_instante']=pd.to_datetime(df['din_instante'],errors='coerce')
+    df=df.dropna(subset=['din_instante','fonte']).copy()
+    for col in NUMS: df[col]=pd.to_numeric(df[col],errors='coerce') if col in df else np.nan
+    for col in list(LABELS)+['cod_razaorestricao','id_ons','dsc_restricao','cod_origemrestricao']:
+        df[col]=df[col].fillna('Não informado').astype(str).str.strip() if col in df else 'Não informado'
     df['razao']=df['cod_razaorestricao'].str.upper()
     df['restrito']=df['razao'].isin(REASONS)
-    # Base ONS em intervalos de 30 minutos: MWmed x 0,5h = MWh.
-    # Não imputar valores ausentes de energia não realizada como zero para registros restritos.
-    df['curtailment_mwh']=df['val_geracaonaorealizadaapurada'].clip(lower=0)*0.5
-    df.loc[~df['restrito'],'curtailment_mwh']=0.0
-    df['geracao_mwh']=df['val_geracao']*0.5
+    # Intervalos de 30 minutos: MWmed * 0.5 h = MWh.
+    df['perda_mwh']=df['val_geracaonaorealizadaapurada'].clip(lower=0)*.5
+    df.loc[~df['restrito'],'perda_mwh']=0.0
+    df['geracao_mwh']=df['val_geracao']*.5
     df['data']=df['din_instante'].dt.date
     df['mes']=df['din_instante'].dt.to_period('M').dt.to_timestamp()
-    df['hora']=df['din_instante'].dt.hour+df['din_instante'].dt.minute/60
+    # Impede dupla contagem ao manter somente uma observação por fonte/conjunto/intervalo.
+    df=df.sort_values(['din_instante','arquivo_origem']).drop_duplicates(['fonte','id_ons','din_instante'],keep='last')
     return df
 
-st.title('⚡ Curtailment Brasil')
-st.caption('Painel analítico de restrições de geração renovável • Dados ONS • Solar e eólica')
+def plot(fig,height=420,unified=True):
+    fig.update_layout(template='plotly_white',height=height,margin=dict(l=15,r=15,t=65,b=25),font=dict(family='Arial',size=12,color='#263247'),paper_bgcolor='rgba(0,0,0,0)',plot_bgcolor='rgba(0,0,0,0)',legend_title_text='',hovermode='x unified' if unified else 'closest',title_font_size=17)
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(gridcolor='rgba(100,116,139,.15)',zeroline=False)
+    st.plotly_chart(fig,use_container_width=True)
+
+def fmt(value,unit='MWh'):
+    if pd.isna(value): return '—'
+    if unit=='MWh' and abs(value)>=1000: return f'{value/1000:,.2f} GWh'
+    return f'{value:,.1f} {unit}'
+
+def group_energy(data,group_cols):
+    return data.groupby(group_cols,dropna=False,as_index=False)['perda_mwh'].sum()
+
+st.markdown('<div class="eyebrow">Energy intelligence / ONS</div>',unsafe_allow_html=True)
+st.title('⚡ Constrained-off | SIN')
+st.markdown('<div class="subtitle">Inteligência operacional em restrições de geração eólica e fotovoltaica · Painel exploratório</div>',unsafe_allow_html=True)
+paths=discover_files()
+signatures=tuple((str(p),p.stat().st_size,p.stat().st_mtime_ns) for p in paths)
 with st.sidebar:
-    st.header('Filtros')
-    with st.expander('Origem dos arquivos', expanded=False):
-        for fonte, filename in FILES.items():
-            found = resolve_file(filename) if 'resolve_file' in globals() else next((p for p in (LOCAL_DATA_DIR / filename, ROOT / filename) if p.is_file()), None)
-            st.caption(f'{fonte}: {found if found else "não encontrado no disco do servidor"}')
-    uploaded=st.file_uploader('Opcional: carregar arquivos XLSX',type=['xlsx'],accept_multiple_files=True,help='Se não enviar arquivos, o aplicativo usa os XLSX presentes no repositório. Para substituir, envie arquivos com EOLICA ou FOTOVOLTAICA no nome.')
-    replacements={}
-    for f in uploaded:
-        name=f.name.upper()
-        if 'FOTOVOLTAICA' in name or 'SOLAR' in name: replacements['Fotovoltaica']=f.getvalue()
-        elif 'EOLICA' in name or 'EÓLICA' in name: replacements['Eólica']=f.getvalue()
-    if uploaded and not replacements: st.warning('Nome do arquivo deve conter EOLICA ou FOTOVOLTAICA.')
+    st.header('Centro de filtros')
+    with st.expander('📁 Fontes de dados',expanded=False):
+        st.caption(f'{len(paths)} arquivo(s) detectado(s) no servidor.')
+        for p in paths: st.caption(f'• {p.name} ({p.parent.name})')
+        uploads=st.file_uploader('Adicionar planilhas nesta sessão',type=['xlsx'],accept_multiple_files=True)
+        st.caption('Os arquivos enviados são temporários e não alteram o GitHub.')
+    uploaded=tuple((f.name,f.getvalue()) for f in uploads if source_type(f.name))
 
-# A assinatura evita manter no cache uma versão antiga após substituir um Excel.
-def resolve_file(filename):
-    return next((p for p in (LOCAL_DATA_DIR / filename, ROOT / filename) if p.is_file()), None)
-
-file_signatures = tuple(
-    (fonte, str(p), p.stat().st_size, p.stat().st_mtime_ns)
-    for fonte, filename in FILES.items()
-    if (p := resolve_file(filename)) is not None
-)
-
-df=load_data(replacements or None, file_signatures)
+df=read_files(signatures,uploaded)
 if df.empty:
-    st.error(f'Nenhuma base encontrada. Pasta local: {LOCAL_DATA_DIR}. No Streamlit Cloud, inclua os arquivos na pasta do app (somente se puder compartilhar os dados) ou carregue-os na barra lateral.')
+    st.error('Nenhuma base válida encontrada. Coloque os arquivos RESTRICAO_COFF_*.xlsx na raiz do projeto ou na pasta Bases/ do GitHub.')
     st.stop()
 with st.sidebar:
-    min_date,max_date=df['data'].min(),df['data'].max()
-    selected=st.date_input('Período',(min_date,max_date),min_value=min_date,max_value=max_date)
-    if isinstance(selected,tuple) and len(selected)==2: start,end=selected
-    else: start,end=min_date,max_date
-    fontes=st.multiselect('Fonte',sorted(df['fonte'].unique()),default=sorted(df['fonte'].unique()))
-    opts=df[df['fonte'].isin(fontes)]
-    subs=st.multiselect('Submercado',sorted(opts['nom_subsistema'].unique()),default=[])
-    if subs: opts=opts[opts['nom_subsistema'].isin(subs)]
-    estados=st.multiselect('Estado',sorted(opts['nom_estado'].unique()),default=[])
-    if estados: opts=opts[opts['nom_estado'].isin(estados)]
-    parques=st.multiselect('Parque / conjunto',sorted(opts['nom_usina'].unique()),default=[],placeholder='Todos os parques')
-    if parques: opts=opts[opts['nom_usina'].isin(parques)]
-    razoes=st.multiselect('Razão de restrição',REASONS,default=REASONS)
-    st.caption('A seleção de razão afeta os indicadores e gráficos de curtailment; geração total mantém todos os registros dos parques filtrados.')
-    freq=st.selectbox('Granularidade', ['Diária','30 minutos','Mensal'],index=0)
+    lo,hi=df['data'].min(),df['data'].max()
+    dates=st.date_input('Período',value=(lo,hi),min_value=lo,max_value=hi)
+    start,end=(dates if isinstance(dates,tuple) and len(dates)==2 else (lo,hi))
+    fontes=st.multiselect('Fonte de geração',sorted(df['fonte'].unique()),default=sorted(df['fonte'].unique()))
+    choices=df[df['fonte'].isin(fontes)]
+    subs=st.multiselect('Submercado',sorted(choices['nom_subsistema'].unique()))
+    if subs: choices=choices[choices['nom_subsistema'].isin(subs)]
+    estados=st.multiselect('Estado',sorted(choices['nom_estado'].unique()))
+    if estados: choices=choices[choices['nom_estado'].isin(estados)]
+    parques=st.multiselect('Parque / conjunto',sorted(choices['nom_usina'].unique()),placeholder='Todos os conjuntos')
+    if parques: choices=choices[choices['nom_usina'].isin(parques)]
+    reasons=st.multiselect('Razões de restrição',REASONS,default=REASONS)
+    gran=st.selectbox('Resolução temporal',['Diária','30 minutos','Mensal'])
     st.divider()
-    st.caption('Unidades: MW médios por intervalo de 30 min → MWh = MW × 0,5 h.')
-base=opts[(opts['data']>=start)&(opts['data']<=end)].copy()
-restr=base[base['restrito'] & base['razao'].isin(razoes)].copy()
+    st.caption('Os filtros de razão afetam a perda, não a geração total. Unidade de energia: MWmed × 0,5 h.')
+
+base=choices[(choices['data']>=start)&(choices['data']<=end)].copy()
 if base.empty:
-    st.warning('Não há dados para os filtros escolhidos.');st.stop()
-missing=restr['curtailment_mwh'].isna().sum()
-if missing: st.warning(f'{missing:,} registros com restrição não têm valor de geração não realizada apurada. Eles não entram na soma de energia restringida.'.replace(',','.'))
+    st.warning('Não há registros para a combinação selecionada.');st.stop()
+restr=base[base['restrito']&base['razao'].isin(reasons)].copy()
+missing=int(restr['perda_mwh'].isna().sum())
+energy=restr['perda_mwh'].sum(min_count=1) if len(restr) else 0
+energy=0 if pd.isna(energy) else energy
+generation=base['geracao_mwh'].sum()
+affected=restr.loc[restr['perda_mwh']>0,'nom_usina'].nunique()
+coverage=100*(len(restr)-missing)/len(restr) if len(restr) else 100
+st.caption(f'Janela: {start:%d/%m/%Y} – {end:%d/%m/%Y}  ·  {base["nom_usina"].nunique()} conjuntos  ·  {len(base):,} observações')
+a,b,c,d,e=st.columns(5)
+a.metric('Energia restringida',fmt(energy))
+b.metric('Geração verificada',fmt(generation))
+c.metric('Conjuntos impactados',f'{affected:,}')
+d.metric('Registros com restrição',f'{len(restr):,}')
+e.metric('Cobertura da perda',f'{coverage:.1f}%',help='Percentual de registros restritos com energia não realizada apurada preenchida.')
+if missing: st.warning(f'Qualidade de dados: {missing:,} intervalos restritos não têm energia não realizada apurada; não foram imputados como zero.')
 
-energy=restr['curtailment_mwh'].sum()
-gen=base['geracao_mwh'].sum()
-active=restr.loc[restr['curtailment_mwh']>0,'nom_usina'].nunique()
-c1,c2,c3,c4,c5=st.columns(5)
-c1.metric('Curtailment',f'{energy/1000:,.2f} GWh')
-c2.metric('Geração verificada',f'{gen/1000:,.2f} GWh')
-c3.metric('Conjuntos afetados',f'{active:,}')
-c4.metric('Registros restritos',f'{len(restr):,}')
-c5.metric('Perda / (geração + perda)',f'{energy/(gen+energy)*100:.1f}%' if gen+energy>0 else '—',help='Indicador exploratório, não equivale necessariamente ao índice oficial de curtailment.')
+overview,temporal,rankings,detail,audit=st.tabs(['▦ Visão executiva','◷ Evolução temporal','▤ Rankings','⌁ Análise do conjunto','☷ Dados & auditoria'])
+with overview:
+    l,r=st.columns([1.6,1])
+    with l:
+        t=group_energy(restr,['data','razao'])
+        fig=px.bar(t,x='data',y='perda_mwh',color='razao',color_discrete_map=COLORS,title='Energia restringida por dia e razão',labels={'data':'Data','perda_mwh':'Energia (MWh)','razao':'Razão'})
+        plot(fig)
+    with r:
+        t=group_energy(restr,['razao'])
+        if not t.empty and t['perda_mwh'].sum()>0:
+            fig=px.pie(t,names='razao',values='perda_mwh',hole=.68,color='razao',color_discrete_map=COLORS,title='Composição das restrições')
+            plot(fig,unified=False)
+        else: st.info('Sem perdas apuradas no período.')
+    l,r=st.columns(2)
+    with l:
+        t=group_energy(restr,['fonte','razao'])
+        plot(px.bar(t,x='fonte',y='perda_mwh',color='razao',barmode='stack',color_discrete_map=COLORS,title='Perda por fonte e motivo',labels={'fonte':'Fonte','perda_mwh':'MWh'}))
+    with r:
+        t=group_energy(restr,['nom_subsistema','fonte'])
+        plot(px.bar(t,x='nom_subsistema',y='perda_mwh',color='fonte',barmode='group',color_discrete_map=COLORS,title='Distribuição por submercado',labels={'nom_subsistema':'Submercado','perda_mwh':'MWh'}))
 
-visao,evolucao,ranking,parque,dados=st.tabs(['📊 Visão geral','📈 Evolução temporal','🏆 Rankings','🔎 Análise do conjunto','🗃️ Dados'])
+with temporal:
+    freq={'Diária':'D','30 minutos':'30min','Mensal':'MS'}[gran]
+    t=group_energy(restr,[pd.Grouper(key='din_instante',freq=freq),'razao'])
+    plot(px.area(t,x='din_instante',y='perda_mwh',color='razao',color_discrete_map=COLORS,title=f'Evolução das restrições • {gran}',labels={'din_instante':'Data/hora','perda_mwh':'MWh'}),470)
+    t=base.groupby([pd.Grouper(key='din_instante',freq=freq),'fonte'],as_index=False)['geracao_mwh'].sum()
+    plot(px.line(t,x='din_instante',y='geracao_mwh',color='fonte',color_discrete_map=COLORS,title='Geração verificada por fonte',labels={'din_instante':'Data/hora','geracao_mwh':'MWh'}))
+    r=restr.assign(hora=restr['din_instante'].dt.strftime('%H:%M'))
+    t=group_energy(r,['hora','razao'])
+    plot(px.line(t,x='hora',y='perda_mwh',color='razao',markers=True,color_discrete_map=COLORS,title='Perfil intradiário acumulado da restrição',labels={'hora':'Hora','perda_mwh':'MWh'}))
 
-def plot(fig, key=None):
-    fig.update_layout(template='plotly_dark',height=430,margin=dict(l=15,r=15,t=55,b=20),legend_title_text='',hovermode='x unified')
-    st.plotly_chart(fig,use_container_width=True,key=key)
+with rankings:
+    l,r=st.columns([2,1])
+    with r:
+        dimension=st.selectbox('Dimensão',list(LABELS.values()))
+        top_n=st.slider('Quantidade de posições',5,30,15)
+    col={v:k for k,v in LABELS.items()}[dimension]
+    t=group_energy(restr,[col]).nlargest(top_n,'perda_mwh').sort_values('perda_mwh')
+    with l:
+        plot(px.bar(t,x='perda_mwh',y=col,orientation='h',title=f'Top {top_n} — {dimension}',labels={col:dimension,'perda_mwh':'MWh'}),max(450,top_n*28))
+    st.dataframe(t.sort_values('perda_mwh',ascending=False).rename(columns={col:dimension,'perda_mwh':'Curtailment (MWh)'}),hide_index=True,use_container_width=True)
 
-with visao:
-    left,right=st.columns([1.5,1])
-    with left:
-        t=restr.groupby(['data','razao'],as_index=False)['curtailment_mwh'].sum()
-        fig=px.bar(t,x='data',y='curtailment_mwh',color='razao',color_discrete_map=COLORS,title='Energia restringida por dia e razão',labels={'data':'Data','curtailment_mwh':'MWh','razao':'Razão'})
-        plot(fig,'daily')
-    with right:
-        t=restr.groupby('razao',as_index=False)['curtailment_mwh'].sum()
-        if not t.empty and t['curtailment_mwh'].sum()>0:
-            fig=px.pie(t,names='razao',values='curtailment_mwh',hole=.62,color='razao',color_discrete_map=COLORS,title='Participação das razões')
-            plot(fig,'pie')
-        else: st.info('Sem energia restringida para exibir a distribuição.')
-    t=restr.groupby(['fonte','razao'],as_index=False)['curtailment_mwh'].sum()
-    fig=px.bar(t,x='fonte',y='curtailment_mwh',color='razao',barmode='stack',color_discrete_map=COLORS,title='Curtailment por fonte e razão',labels={'fonte':'Fonte','curtailment_mwh':'MWh'})
-    plot(fig,'sources')
-
-with evolucao:
-    gran={'Diária':'D','30 minutos':'30min','Mensal':'MS'}[freq]
-    r=restr.groupby([pd.Grouper(key='din_instante',freq=gran),'razao'],as_index=False)['curtailment_mwh'].sum()
-    fig=px.area(r,x='din_instante',y='curtailment_mwh',color='razao',color_discrete_map=COLORS,title=f'Evolução do curtailment • {freq}',labels={'din_instante':'Data/hora','curtailment_mwh':'MWh'})
-    plot(fig,'time')
-    g=base.groupby([pd.Grouper(key='din_instante',freq=gran),'fonte'],as_index=False)['geracao_mwh'].sum()
-    fig=px.line(g,x='din_instante',y='geracao_mwh',color='fonte',color_discrete_map=COLORS,markers=(freq!='30 minutos'),title='Geração verificada por fonte',labels={'din_instante':'Data/hora','geracao_mwh':'MWh'})
-    plot(fig,'generation')
-    hh=restr.groupby(['hora','razao'],as_index=False)['curtailment_mwh'].sum()
-    fig=px.line(hh,x='hora',y='curtailment_mwh',color='razao',color_discrete_map=COLORS,markers=True,title='Perfil horário acumulado da restrição',labels={'hora':'Hora do dia','curtailment_mwh':'MWh'})
-    plot(fig,'hour')
-
-with ranking:
-    dim=st.selectbox('Agrupar ranking por',['Parque / conjunto','Estado','Submercado','Agente operador','Ponto de conexão'])
-    dims={'Parque / conjunto':'nom_usina','Estado':'nom_estado','Submercado':'nom_subsistema','Agente operador':'nom_agenteoperador','Ponto de conexão':'nom_pontoconexao'}
-    top=st.slider('Top N',5,40,15)
-    t=restr.groupby(dims[dim],as_index=False)['curtailment_mwh'].sum().nlargest(top,'curtailment_mwh').sort_values('curtailment_mwh')
-    fig=px.bar(t,x='curtailment_mwh',y=dims[dim],orientation='h',title=f'Top {top} • {dim}',labels={'curtailment_mwh':'Curtailment (MWh)',dims[dim]:dim})
-    fig.update_layout(height=max(430,top*27))
-    st.plotly_chart(fig,use_container_width=True)
-    st.dataframe(t.sort_values('curtailment_mwh',ascending=False),hide_index=True,use_container_width=True)
-
-with parque:
-    options=sorted(base['nom_usina'].unique())
-    chosen=st.selectbox('Selecione o conjunto',options)
-    b=base[base['nom_usina']==chosen].sort_values('din_instante')
-    rr=restr[restr['nom_usina']==chosen]
-    a,bcol,c=st.columns(3)
-    a.metric('Curtailment do conjunto',f'{rr["curtailment_mwh"].sum():,.1f} MWh')
-    bcol.metric('Geração verificada',f'{b["geracao_mwh"].sum():,.1f} MWh')
-    c.metric('Intervalos com restrição',f'{len(rr):,}')
+with detail:
+    chosen=st.selectbox('Selecione o conjunto para análise',sorted(base['nom_usina'].unique()))
+    one=base[base['nom_usina']==chosen].sort_values('din_instante')
+    one_restr=restr[restr['nom_usina']==chosen]
+    x,y,z=st.columns(3)
+    x.metric('Energia restringida',fmt(one_restr['perda_mwh'].sum()))
+    y.metric('Geração verificada',fmt(one['geracao_mwh'].sum()))
+    z.metric('Intervalos restritos',len(one_restr))
     fig=go.Figure()
-    for col,label,color in [('val_geracao','Geração verificada','#38bdf8'),('val_geracaoreferencia','Geração referência','#fbbf24'),('val_geracaoreferenciafinal','Referência final','#a78bfa'),('val_disponibilidade','Disponibilidade','#34d399')]:
-        if b[col].notna().any():fig.add_trace(go.Scatter(x=b['din_instante'],y=b[col],name=label,mode='lines',line=dict(color=color)))
-    fig.update_layout(title='Potências do conjunto • MW médios',yaxis_title='MW')
-    plot(fig,'park_lines')
-    if not rr.empty:
-        fig=px.bar(rr,x='din_instante',y='curtailment_mwh',color='razao',color_discrete_map=COLORS,title='Energia restringida por intervalo',labels={'din_instante':'Data/hora','curtailment_mwh':'MWh'})
-        plot(fig,'park_curt')
-    st.dataframe(b[['din_instante','fonte','nom_usina','val_geracao','val_disponibilidade','val_geracaoreferencia','val_geracaoreferenciafinal','razao','curtailment_mwh']],hide_index=True,use_container_width=True)
+    for col,label,color in [('val_geracao','Geração verificada','#3B82F6'),('val_geracaoreferencia','Referência','#F59E0B'),('val_geracaoreferenciafinal','Referência final','#8B5CF6'),('val_disponibilidade','Disponibilidade','#10B981'),('val_geracaolimitada','Geração limitada','#64748B')]:
+        if one[col].notna().any(): fig.add_trace(go.Scatter(x=one['din_instante'],y=one[col],name=label,mode='lines',line=dict(color=color,width=2)))
+    fig.update_layout(title=f'Potências operativas — {chosen}',yaxis_title='MW médios')
+    plot(fig,490)
+    t=group_energy(one_restr,['din_instante','razao'])
+    plot(px.bar(t,x='din_instante',y='perda_mwh',color='razao',color_discrete_map=COLORS,title='Energia restringida por intervalo',labels={'din_instante':'Data/hora','perda_mwh':'MWh'}))
+    st.dataframe(one[['din_instante','fonte','nom_usina','val_geracao','val_disponibilidade','val_geracaoreferencia','val_geracaoreferenciafinal','razao','perda_mwh']],hide_index=True,use_container_width=True)
 
-with dados:
-    st.caption('Exportação da seleção atual. Linhas sem restrição são preservadas para auditoria.')
-    export=base.copy()
-    export['curtailment_mwh_filtrado']=np.where(export['razao'].isin(razoes),export['curtailment_mwh'],0.0)
-    st.dataframe(export,hide_index=True,use_container_width=True,height=480)
-    st.download_button('⬇️ Baixar dados filtrados (CSV)',data=export.to_csv(index=False,sep=';',decimal=',').encode('utf-8-sig'),file_name='curtailment_filtrado.csv',mime='text/csv')
-    st.markdown('**Qualidade da base**')
-    st.write({'Registros':len(base),'Datas':f'{start} a {end}','Conjuntos':base['nom_usina'].nunique(),'Restritos sem energia apurada':int(missing),'Intervalos duplicados por fonte/ID ONS/data':int(base.duplicated(['fonte','id_ons','din_instante']).sum())})
-
+with audit:
+    st.subheader('Rastreabilidade e qualidade da informação')
+    q1,q2,q3=st.columns(3)
+    q1.metric('Registros filtrados',f'{len(base):,}')
+    q2.metric('Perdas ausentes em restrições',f'{missing:,}')
+    q3.metric('Arquivos considerados',base['arquivo_origem'].nunique())
+    st.dataframe(base.groupby(['arquivo_origem','fonte'],as_index=False).agg(registros=('din_instante','size'),inicio=('din_instante','min'),fim=('din_instante','max')),hide_index=True,use_container_width=True)
+    st.caption('A exportação preserva os registros da seleção atual, inclusive os não restritos. Os valores ausentes permanecem nulos.')
+    st.dataframe(base,hide_index=True,use_container_width=True,height=410)
+    st.download_button('⬇ Exportar seleção em CSV',base.to_csv(index=False,sep=';',decimal=',').encode('utf-8-sig'),file_name='constrained_off_sin.csv',mime='text/csv')
+    st.info('Metodologia: energia em MWh = potência média (MWmed) × 0,5 h. A classificação ENE/CNF/REL usa cod_razaorestricao. Os resultados são exploratórios e devem ser confrontados com as regras oficiais antes de uso regulatório.')
 st.divider()
-st.caption('Fonte: planilhas ONS fornecidas pelo usuário. Conversão assumida: 30 minutos por registro. Verifique a unidade e a metodologia oficial antes de utilizar os resultados em relatórios regulatórios.')
+st.markdown('<div class="footnote">Constrained-off SIN • Dados de origem ONS • Visualização exploratória • Atualização mediante commit de novas planilhas</div>',unsafe_allow_html=True)
