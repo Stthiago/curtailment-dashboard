@@ -8,6 +8,7 @@ import streamlit as st
 
 st.set_page_config(page_title='Curtailment Brasil | ONS', page_icon='⚡', layout='wide', initial_sidebar_state='expanded')
 ROOT = Path(__file__).resolve().parent
+LOCAL_DATA_DIR = Path(r'C:\Users\tsc\OneDrive - Elera\Desktop\Projeto LT (Pós)')
 FILES = {'Fotovoltaica': 'RESTRICAO_COFF_FOTOVOLTAICA_2026_11.xlsx', 'Eólica': 'RESTRICAO_COFF_EOLICA_2026_11.xlsx'}
 REASONS = ['ENE', 'CNF', 'REL']
 COLORS = {'ENE':'#f59e0b','CNF':'#8b5cf6','REL':'#06b6d4','Fotovoltaica':'#fbbf24','Eólica':'#38bdf8'}
@@ -15,14 +16,15 @@ NUMERIC = ['val_geracao','val_geracaolimitada','val_disponibilidade','val_geraca
 st.markdown('''<style>.block-container{padding-top:1.3rem;max-width:1600px}.stMetric{background:rgba(125,125,125,.07);padding:16px;border-radius:14px;border:1px solid rgba(125,125,125,.16)}h1{letter-spacing:-.04em}div[data-testid="stSidebar"]{border-right:1px solid rgba(125,125,125,.15)}</style>''', unsafe_allow_html=True)
 
 @st.cache_data(show_spinner='Lendo bases ONS...')
-def load_data(file_bytes=None):
+def load_data(file_bytes=None, file_signatures=()):
     chunks=[]
     for fonte, filename in FILES.items():
         if file_bytes and fonte in file_bytes:
             stream=io.BytesIO(file_bytes[fonte])
         else:
-            path=ROOT/filename
-            if not path.exists():
+            # Primeiro tenta a pasta local do Windows; depois a pasta do app.
+            path = next((candidate for candidate in (LOCAL_DATA_DIR / filename, ROOT / filename) if candidate.is_file()), None)
+            if path is None:
                 continue
             stream=path
         d=pd.read_excel(stream, engine='openpyxl')
@@ -58,6 +60,10 @@ st.title('⚡ Curtailment Brasil')
 st.caption('Painel analítico de restrições de geração renovável • Dados ONS • Solar e eólica')
 with st.sidebar:
     st.header('Filtros')
+    with st.expander('Origem dos arquivos', expanded=False):
+        for fonte, filename in FILES.items():
+            found = resolve_file(filename) if 'resolve_file' in globals() else next((p for p in (LOCAL_DATA_DIR / filename, ROOT / filename) if p.is_file()), None)
+            st.caption(f'{fonte}: {found if found else "não encontrado no disco do servidor"}')
     uploaded=st.file_uploader('Opcional: carregar arquivos XLSX',type=['xlsx'],accept_multiple_files=True,help='Se não enviar arquivos, o aplicativo usa os XLSX presentes no repositório. Para substituir, envie arquivos com EOLICA ou FOTOVOLTAICA no nome.')
     replacements={}
     for f in uploaded:
@@ -66,9 +72,19 @@ with st.sidebar:
         elif 'EOLICA' in name or 'EÓLICA' in name: replacements['Eólica']=f.getvalue()
     if uploaded and not replacements: st.warning('Nome do arquivo deve conter EOLICA ou FOTOVOLTAICA.')
 
-df=load_data(replacements or None)
+# A assinatura evita manter no cache uma versão antiga após substituir um Excel.
+def resolve_file(filename):
+    return next((p for p in (LOCAL_DATA_DIR / filename, ROOT / filename) if p.is_file()), None)
+
+file_signatures = tuple(
+    (fonte, str(p), p.stat().st_size, p.stat().st_mtime_ns)
+    for fonte, filename in FILES.items()
+    if (p := resolve_file(filename)) is not None
+)
+
+df=load_data(replacements or None, file_signatures)
 if df.empty:
-    st.error('Nenhuma base encontrada. Coloque os dois arquivos XLSX na mesma pasta de app.py ou carregue-os na barra lateral.')
+    st.error(f'Nenhuma base encontrada. Pasta local: {LOCAL_DATA_DIR}. No Streamlit Cloud, inclua os arquivos na pasta do app (somente se puder compartilhar os dados) ou carregue-os na barra lateral.')
     st.stop()
 with st.sidebar:
     min_date,max_date=df['data'].min(),df['data'].max()
